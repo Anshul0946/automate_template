@@ -34,7 +34,7 @@ st.title("📡 Advanced Cellular Template Processor")
 YOUR_SITE_URL = "http://localhost"
 YOUR_SITE_NAME = "Advanced Cellular Template Processor"
 API_BASE = "https://openrouter.apify.actor/api/v1"
-MODEL_SERVICE = "google/gemini-2.5-flash"
+MODEL_SERVICE = "google/gemini-2.5-pro"
 MODEL_GENERIC = "google/gemini-2.5-flash-lite"
 
 # --- Schemas ---
