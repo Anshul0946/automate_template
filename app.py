@@ -664,33 +664,607 @@ def process_file_streamlit(user_file_path: str,
             if res and res.get("image_type") == "voice_call":
                 voice_test[Path(img).stem] = res.get("data", {})
 
-    # (Evaluation passes, mapping and Rule 3 preserved from your logic)
-    # For brevity: keep original evaluation mapping and remapping logic here exactly as in your
-    # working code. The earlier version already implemented them carefully; we keep them unchanged
-    # except for using local_template directly (no copy). To avoid repeating huge blocks here,
-    # we continue with the same behavior (the previous rewrite contained that logic).
+    # ---------------- Evaluation pass & Rule 2 ----------------
+    log_append(text_area_placeholder, logs, "\n[LOG] Starting evaluation pass to refill missing/null fields.")
+    retried_service_sectors = set()
+    retried_images = set()
 
-    # --- For clarity and to avoid huge duplication in this message, we will re-use the evaluation /
-    # Rule2 / Rule3 blocks from your previous working version (they are unchanged) ---
-    # Implementing those blocks exactly (omitted here to keep message manageable)...
-    #
-    # NOTE: In this paste we include all of that logic above — in your copy please keep all the
-    # evaluation and Rule3 code you need (the previous big function in your repo). The primary
-    # bugfix applied here is the removal of the internal "copy" and the restriction to .xlsx.
+    def contains_nulls(d):
+        if not isinstance(d, dict):
+            return False
+        for v in d.values():
+            if v is None:
+                return True
+            if isinstance(v, dict) and contains_nulls(v):
+                return True
+        return False
 
-    # For safety we will do a minimal finalization: save and return the local_template path.
-    try:
-        # If any earlier modification steps wrote to workbook, they used openpyxl.save(local_template).
-        # We'll just confirm the file exists and return it.
-        if os.path.exists(local_template):
-            log_append(text_area_placeholder, logs, f"[LOG] Processing finished; output file: {local_template}")
-            return local_template
+    # Evaluate service dicts
+    for sector in ["alpha", "beta", "gamma"]:
+        svc_var = {"alpha": alpha_service, "beta": beta_service, "gamma": gamma_service}[sector]
+        if not svc_var:
+            img1 = next((p for p in images_by_sector[sector] if Path(p).stem.endswith("_image_1")), None)
+            img2 = next((p for p in images_by_sector[sector] if Path(p).stem.endswith("_image_2")), None)
+            if img1 and img2 and sector not in retried_service_sectors:
+                log_append(text_area_placeholder, logs, f"[EVAL] Service dict empty for {sector}. Re-evaluating.")
+                eval_res = evaluate_service_images(token, img1, img2, model_service, text_area_placeholder, logs)
+                retried_service_sectors.add(sector)
+                if eval_res:
+                    if sector == "alpha":
+                        alpha_service = eval_res
+                    elif sector == "beta":
+                        beta_service = eval_res
+                    elif sector == "gamma":
+                        gamma_service = eval_res
+            continue
+
+        if contains_nulls(svc_var) and sector not in retried_service_sectors:
+            img1 = next((p for p in images_by_sector[sector] if Path(p).stem.endswith("_image_1")), None)
+            img2 = next((p for p in images_by_sector[sector] if Path(p).stem.endswith("_image_2")), None)
+            if img1 and img2:
+                log_append(text_area_placeholder, logs, f"[EVAL] Found nulls in {sector}_service; re-evaluating.")
+                eval_res = evaluate_service_images(token, img1, img2, model_service, text_area_placeholder, logs)
+                retried_service_sectors.add(sector)
+                if eval_res:
+                    target = {"alpha": alpha_service, "beta": beta_service, "gamma": gamma_service}[sector]
+                    for k, v in eval_res.items():
+                        if target.get(k) is None and v is not None:
+                            target[k] = v
+
+    # Helper: retry single images (normal then careful)
+    def _retry_image_and_merge(image_name: str, sector_var_map: dict) -> bool:
+        image_path = os.path.join(images_temp, f"{image_name}.png")
+        if not os.path.exists(image_path):
+            found = None
+            for s_list in images_by_sector.values():
+                for p in s_list:
+                    if Path(p).stem == image_name:
+                        found = p
+                        break
+                if found:
+                    break
+            if found:
+                image_path = found
+            else:
+                log_append(text_area_placeholder, logs, f"[EVAL WARN] Image {image_name} not found. Skipping.")
+                return False
+        if image_path in retried_images:
+            return False
+
+        is_voice = image_name.startswith("voicetest")
+        log_append(text_area_placeholder, logs, f"[EVAL] Attempting normal analyze for {image_name}.")
+        if is_voice:
+            normal_res = analyze_voice_image(token, image_path, model_generic, text_area_placeholder, logs)
         else:
-            log_append(text_area_placeholder, logs, f"[ERROR] Expected output file missing after processing: {local_template}")
+            normal_res = analyze_generic_image(token, image_path, model_generic, text_area_placeholder, logs)
+
+        retried_images.add(image_path)
+        if normal_res and "image_type" in normal_res:
+            sector_var_map.setdefault(image_name, {})
+            data = normal_res.get("data", {})
+            for k, v in data.items():
+                if sector_var_map[image_name].get(k) is None and v is not None:
+                    sector_var_map[image_name][k] = v
+            return True
+
+        log_append(text_area_placeholder, logs, f"[EVAL] Normal analyze didn't help for {image_name}. Trying careful evaluation.")
+        if is_voice:
+            eval_res = evaluate_voice_image(token, image_path, model_generic, text_area_placeholder, logs)
+        else:
+            eval_res = evaluate_generic_image(token, image_path, model_generic, text_area_placeholder, logs)
+
+        if not eval_res or "image_type" not in eval_res:
+            log_append(text_area_placeholder, logs, f"[EVAL] Careful evaluation returned nothing for {image_name}.")
+            return False
+
+        sector_var_map.setdefault(image_name, {})
+        for k, v in eval_res.get("data", {}).items():
+            if sector_var_map[image_name].get(k) is None and v is not None:
+                sector_var_map[image_name][k] = v
+        return True
+
+    sector_maps = [
+        ("alpha", alpha_speedtest, alpha_video),
+        ("beta", beta_speedtest, beta_video),
+        ("gamma", gamma_speedtest, gamma_video),
+    ]
+
+    expected_indices = {"service": [1, 2], "speed": [3, 4, 5, 6, 7], "video": [8]}
+
+    def missing_service_fields(svc_obj):
+        missing = []
+        for k in SERVICE_SCHEMA.keys():
+            if k not in svc_obj or svc_obj.get(k) is None:
+                missing.append(k)
+        return missing
+
+    for sector, speed_map, video_map in sector_maps:
+        log_append(text_area_placeholder, logs, f"[RULE2] Verifying expected items for {sector}.")
+        svc_var = {"alpha": alpha_service, "beta": beta_service, "gamma": gamma_service}[sector]
+        svc_missing = missing_service_fields(svc_var) if svc_var else list(SERVICE_SCHEMA.keys())
+        if svc_missing:
+            log_append(text_area_placeholder, logs, f"[RULE2] Service for {sector} missing: {svc_missing}")
+            img1 = next((p for p in images_by_sector[sector] if Path(p).stem.endswith("_image_1")), None)
+            img2 = next((p for p in images_by_sector[sector] if Path(p).stem.endswith("_image_2")), None)
+            if img1 and img2 and sector not in retried_service_sectors:
+                log_append(text_area_placeholder, logs, f"[RULE2] Re-process service images for {sector}.")
+                normal_svc = process_service_images(token, img1, img2, model_service, text_area_placeholder, logs)
+                retried_service_sectors.add(sector)
+                if normal_svc:
+                    target = {"alpha": alpha_service, "beta": beta_service, "gamma": gamma_service}[sector]
+                    for k, v in normal_svc.items():
+                        if target.get(k) is None and v is not None:
+                            target[k] = v
+                    if missing_service_fields(target):
+                        log_append(text_area_placeholder, logs, f"[RULE2] Careful eval for service images {sector}.")
+                        eval_svc = evaluate_service_images(token, img1, img2, model_service, text_area_placeholder, logs)
+                        if eval_svc:
+                            for k, v in eval_svc.items():
+                                if target.get(k) is None and v is not None:
+                                    target[k] = v
+            else:
+                log_append(text_area_placeholder, logs, f"[RULE2] Cannot re-process {sector} (missing or already retried).")
+
+        for idx in expected_indices["speed"]:
+            name = f"{sector}_image_{idx}"
+            if name not in speed_map:
+                log_append(text_area_placeholder, logs, f"[RULE2] Missing expected speed image {name}. Searching files.")
+                file_path = next((p for p in images_by_sector[sector] if Path(p).stem == name), None)
+                if file_path:
+                    log_append(text_area_placeholder, logs, f"[RULE2] Found {name}. Processing.")
+                    _retry_image_and_merge(name, speed_map)
+                else:
+                    log_append(text_area_placeholder, logs, f"[RULE2] No file for expected {name}.")
+            else:
+                missing = []
+                for k in GENERIC_SCHEMAS["speed_test"]["data"].keys():
+                    if k not in speed_map[name] or speed_map[name].get(k) is None:
+                        missing.append(k)
+                if missing:
+                    log_append(text_area_placeholder, logs, f"[RULE2] {name} missing {missing}. Re-evaluating.")
+                    _retry_image_and_merge(name, speed_map)
+
+        for idx in expected_indices["video"]:
+            name = f"{sector}_image_{idx}"
+            if name not in video_map:
+                file_path = next((p for p in images_by_sector[sector] if Path(p).stem == name), None)
+                if file_path:
+                    log_append(text_area_placeholder, logs, f"[RULE2] Found video {name}. Processing.")
+                    _retry_image_and_merge(name, video_map)
+                else:
+                    log_append(text_area_placeholder, logs, f"[RULE2] No file for expected video {name}.")
+            else:
+                missing = []
+                for k in GENERIC_SCHEMAS["video_test"]["data"].keys():
+                    if k not in video_map[name] or video_map[name].get(k) is None:
+                        missing.append(k)
+                if missing:
+                    log_append(text_area_placeholder, logs, f"[RULE2] {name} missing {missing}. Re-evaluating.")
+                    _retry_image_and_merge(name, video_map)
+
+    # voicetest checks
+    log_append(text_area_placeholder, logs, "[RULE2] Verifying voicetest completeness.")
+    for idx in [1, 2, 3]:
+        name = f"voicetest_image_{idx}"
+        if name not in voice_test:
+            file_path = next((p for p in images_by_sector["voicetest"] if Path(p).stem == name), None)
+            if file_path:
+                log_append(text_area_placeholder, logs, f"[RULE2] Missing voice entry {name}. Processing.")
+                _retry_image_and_merge(name, voice_test)
+            else:
+                log_append(text_area_placeholder, logs, f"[RULE2] No file for expected voice {name}.")
+        else:
+            missing = []
+            for k in GENERIC_SCHEMAS["voice_call"]["data"].keys():
+                if k not in voice_test[name] or voice_test[name].get(k) is None:
+                    missing.append(k)
+            if missing:
+                log_append(text_area_placeholder, logs, f"[RULE2] {name} missing {missing}. Re-evaluating.")
+                _retry_image_and_merge(name, voice_test)
+
+    log_append(text_area_placeholder, logs, "[LOG] Rule 2 verification complete.")
+
+    # ---------- compute averages ----------
+    def _to_number(v):
+        try:
+            if v is None:
+                return None
+            if isinstance(v, bool):
+                return None
+            return float(v)
+        except Exception:
             return None
+
+    def _compute_speed_averages(speed_map):
+        metrics = {"download_mbps": [], "upload_mbps": [], "ping_ms": []}
+        for entry in speed_map.values():
+            if not isinstance(entry, dict):
+                continue
+            for m in metrics.keys():
+                val = _to_number(entry.get(m))
+                if val is not None:
+                    metrics[m].append(val)
+        result = {}
+        for m, vals in metrics.items():
+            if vals:
+                result[m] = sum(vals) / len(vals)
+            else:
+                result[m] = None
+        return result
+
+    avearge = {
+        "avearge_alpha_speedtest": _compute_speed_averages(alpha_speedtest),
+        "avearge_beta_speedtest": _compute_speed_averages(beta_speedtest),
+        "avearge_gamma_speedtest": _compute_speed_averages(gamma_speedtest),
+    }
+
+    # ---------------- Mapping: extract bold+red expressions and replace ----------------
+    log_append(text_area_placeholder, logs, "[LOG] Scanning workbook for BOLD+RED expressions and replacing with values.")
+    try:
+        wb_edit = openpyxl.load_workbook(local_template)
+        sheet_edit = wb_edit.active
+        cells_to_process = []
+
+        def _font_is_strict_red(font):
+            if not font:
+                return False
+            if not getattr(font, "bold", False):
+                return False
+            col = getattr(font, "color", None)
+            if col is None:
+                return False
+            rgb = getattr(col, "rgb", None)
+            if not rgb:
+                return False
+            up = str(rgb).upper()
+            return up[-6:] == "FF0000"
+
+        def _normalize_expr(raw: str) -> str:
+            s = raw.strip()
+            if (s.startswith('"') and s.endswith('"')) or (s.startswith("'") and s.endswith("'")):
+                s = s[1:-1].strip()
+            return s
+
+        for row in sheet_edit.iter_rows(min_row=1, max_row=sheet_edit.max_row, min_col=1, max_col=16):
+            for cell in row:
+                val = cell.value
+                if not val or not isinstance(val, str):
+                    continue
+                font = cell.font
+                if not font:
+                    continue
+                if _font_is_strict_red(font):
+                    expr = _normalize_expr(val)
+                    if expr:
+                        extract_text.append(expr)
+                        cells_to_process.append((cell, expr))
+
+        allowed_vars = {
+            "alpha_service": alpha_service,
+            "beta_service": beta_service,
+            "gamma_service": gamma_service,
+            "alpha_speedtest": alpha_speedtest,
+            "beta_speedtest": beta_speedtest,
+            "gamma_speedtest": gamma_speedtest,
+            "alpha_video": alpha_video,
+            "beta_video": beta_video,
+            "gamma_video": gamma_video,
+            "voice_test": voice_test,
+            "avearge": avearge,
+        }
+
+        def _to_number_convert(v):
+            try:
+                if v is None:
+                    return None
+                if isinstance(v, (int, float)):
+                    return v
+                if isinstance(v, bool):
+                    return None
+                s = str(v).strip()
+                s_clean = s.replace(",", "")
+                if s_clean == "":
+                    return None
+                if re.fullmatch(r"[-+]?\d+", s_clean):
+                    return int(s_clean)
+                if re.fullmatch(r"[-+]?\d*\.\d+", s_clean):
+                    return float(s_clean)
+                return None
+            except Exception:
+                return None
+
+        for cell_obj, expr in cells_to_process:
+            resolved = resolve_expression_with_vars(expr, allowed_vars)
+            if resolved is None:
+                cell_obj.value = "NULL"
+            else:
+                if isinstance(resolved, str):
+                    conv = _to_number_convert(resolved)
+                    if conv is not None:
+                        cell_obj.value = conv
+                    else:
+                        cell_obj.value = resolved
+                elif isinstance(resolved, (int, float)):
+                    cell_obj.value = resolved
+                elif isinstance(resolved, (dict, list)):
+                    try:
+                        cell_obj.value = json.dumps(resolved)
+                    except Exception:
+                        cell_obj.value = str(resolved)
+                else:
+                    cell_obj.value = str(resolved)
+
+        wb_edit.save(local_template)
+        log_append(text_area_placeholder, logs, f"[LOG] Workbook updated and saved: {local_template}")
     except Exception as e:
-        log_append(text_area_placeholder, logs, f"[ERROR] Unexpected finalization error: {e}")
-        return None
+        log_append(text_area_placeholder, logs, f"[ERROR] Failed mapping pass: {e}")
+
+    # ---------------- Rule 3: remap NULL cells using strict AI re-checks ----------------
+    log_append(text_area_placeholder, logs, "[LOG] Running Rule 3: remap any remaining NULL bold+red expressions with AI.")
+    try:
+        wb_r3 = openpyxl.load_workbook(local_template)
+        sheet_r3 = wb_r3.active
+
+        allowed_vars = {
+            "alpha_service": alpha_service,
+            "beta_service": beta_service,
+            "gamma_service": gamma_service,
+            "alpha_speedtest": alpha_speedtest,
+            "beta_speedtest": beta_speedtest,
+            "gamma_speedtest": gamma_speedtest,
+            "alpha_video": alpha_video,
+            "beta_video": beta_video,
+            "gamma_video": gamma_video,
+            "voice_test": voice_test,
+            "avearge": avearge,
+        }
+
+        problematic_cells = []
+        for row in sheet_r3.iter_rows(min_row=1, max_row=sheet_r3.max_row, min_col=1, max_col=16):
+            for cell in row:
+                val = cell.value
+                if not isinstance(val, str):
+                    continue
+                if val.strip().upper() != "NULL":
+                    continue
+                font = cell.font
+                if font and _font_is_strict_red(font):
+                    problematic_cells.append(cell)
+
+        remapped = 0
+        for cell in problematic_cells:
+            # find a candidate expression from extract_text that references a known base var
+            candidate = None
+            for ex in extract_text:
+                mm = re.match(r"^([A-Za-z_]\w*)", ex.strip())
+                if not mm:
+                    continue
+                base = mm.group(1)
+                # normalize base
+                if _normalize_name(base) in {_normalize_name(k) for k in allowed_vars.keys()}:
+                    if resolve_expression_with_vars(ex, allowed_vars) is None:
+                        candidate = ex
+                        break
+            if not candidate:
+                continue
+
+            expr = candidate
+            log_append(text_area_placeholder, logs, f"[RULE3] Attempting strict re-map '{expr}' for cell {cell.coordinate}")
+            m = re.match(r"^([A-Za-z_]\w*)(.*)$", expr)
+            if not m:
+                log_append(text_area_placeholder, logs, f"[RULE3] Could not parse '{expr}'. Skipping.")
+                continue
+            base_raw = m.group(1)
+            rest = m.group(2) or ""
+            norm_map = {_normalize_name(k): k for k in allowed_vars.keys()}
+            base_key = norm_map.get(_normalize_name(base_raw))
+            if not base_key:
+                log_append(text_area_placeholder, logs, f"[RULE3] Base '{base_raw}' not found. Skipping.")
+                continue
+
+            # If service variable, try re-evaluate images first
+            if base_key in ("alpha_service", "beta_service", "gamma_service"):
+                sector = base_key.split("_")[0]
+                img1 = next((p for p in images_by_sector[sector] if Path(p).stem.endswith("_image_1")), None)
+                img2 = next((p for p in images_by_sector[sector] if Path(p).stem.endswith("_image_2")), None)
+                if img1 and img2:
+                    log_append(text_area_placeholder, logs, f"[RULE3] Re-evaluating service images for {sector} (strict).")
+                    svc_eval = evaluate_service_images(token, img1, img2, model_service, text_area_placeholder, logs)
+                    if svc_eval:
+                        allowed_vars[base_key].update(svc_eval)
+                        resolved_after = resolve_expression_with_vars(expr, allowed_vars)
+                        if resolved_after is not None:
+                            keys = key_pattern.findall(rest)
+                            set_nested_value_case_insensitive(allowed_vars[base_key], keys, resolved_after)
+                            if isinstance(resolved_after, (int, float)):
+                                cell.value = resolved_after
+                            elif isinstance(resolved_after, str):
+                                cell.value = resolved_after
+                            else:
+                                try:
+                                    cell.value = json.dumps(resolved_after)
+                                except Exception:
+                                    cell.value = str(resolved_after)
+                            remapped += 1
+                            continue
+                log_append(text_area_placeholder, logs, f"[RULE3] Asking model for '{expr}' using '{base_key}'")
+                value = ask_model_for_expression_value(token, base_key, allowed_vars[base_key], expr, model_generic, text_area_placeholder, logs)
+                if value is not None:
+                    keys = key_pattern.findall(rest)
+                    set_nested_value_case_insensitive(allowed_vars[base_key], keys, value)
+                    if isinstance(value, (int, float)):
+                        cell.value = value
+                    elif isinstance(value, str):
+                        cell.value = value
+                    else:
+                        try:
+                            cell.value = json.dumps(value)
+                        except Exception:
+                            cell.value = str(value)
+                    remapped += 1
+                    continue
+                else:
+                    log_append(text_area_placeholder, logs, f"[RULE3] Model couldn't provide value for '{expr}'.")
+                    continue
+
+            # For non-service variables (speed/video/voice), expect image key as first bracket
+            keys = key_pattern.findall(rest)
+            if not keys:
+                log_append(text_area_placeholder, logs, f"[RULE3] No keys in '{expr}'. Skipping.")
+                continue
+            image_key = keys[0]
+            file_path = None
+            for lst in images_by_sector.values():
+                for p in lst:
+                    if Path(p).stem == image_key:
+                        file_path = p
+                        break
+                if file_path:
+                    break
+
+            if not file_path:
+                log_append(text_area_placeholder, logs, f"[RULE3] No file for image '{image_key}'. Asking model with '{base_key}'.")
+                value = ask_model_for_expression_value(token, base_key, allowed_vars[base_key], expr, model_generic, text_area_placeholder, logs)
+                if value is not None:
+                    set_nested_value_case_insensitive(allowed_vars[base_key], keys[1:], value)
+                    if isinstance(value, (int, float)):
+                        cell.value = value
+                    elif isinstance(value, str):
+                        cell.value = value
+                    else:
+                        try:
+                            cell.value = json.dumps(value)
+                        except Exception:
+                            cell.value = str(value)
+                    remapped += 1
+                else:
+                    log_append(text_area_placeholder, logs, f"[RULE3] Could not remap '{expr}'.")
+                continue
+
+            # If file found: strict evaluate image
+            if image_key.startswith("voicetest"):
+                log_append(text_area_placeholder, logs, f"[RULE3] Strictly evaluating voice image '{image_key}'.")
+                voice_eval = evaluate_voice_image(token, file_path, model_generic, text_area_placeholder, logs)
+                if voice_eval and "data" in voice_eval:
+                    voice_test.setdefault(image_key, {}).update(voice_eval["data"])
+                    nested_keys = keys[1:]
+                    resolved_after = resolve_expression_with_vars(expr, {**allowed_vars, "voice_test": voice_test})
+                    if resolved_after is not None:
+                        set_nested_value_case_insensitive(voice_test, nested_keys, resolved_after)
+                        if isinstance(resolved_after, (int, float)):
+                            cell.value = resolved_after
+                        elif isinstance(resolved_after, str):
+                            cell.value = resolved_after
+                        else:
+                            try:
+                                cell.value = json.dumps(resolved_after)
+                            except Exception:
+                                cell.value = str(resolved_after)
+                        remapped += 1
+                        continue
+                log_append(text_area_placeholder, logs, f"[RULE3] Asking model for '{expr}' using 'voice_test'.")
+                value = ask_model_for_expression_value(token, "voice_test", voice_test, expr, model_generic, text_area_placeholder, logs)
+                if value is not None:
+                    set_nested_value_case_insensitive(voice_test, keys[1:], value)
+                    cell.value = value if not isinstance(value, dict) else json.dumps(value)
+                    remapped += 1
+                else:
+                    log_append(text_area_placeholder, logs, f"[RULE3] Could not remap '{expr}' from voice image.")
+                continue
+            else:
+                # generic image (speed/video)
+                log_append(text_area_placeholder, logs, f"[RULE3] Strictly evaluating generic image '{image_key}'.")
+                gen_eval = evaluate_generic_image(token, file_path, model_generic, text_area_placeholder, logs)
+                if gen_eval and "data" in gen_eval:
+                    pref = image_key.split("_")[0]
+                    if pref == "alpha":
+                        if gen_eval.get("image_type") == "speed_test":
+                            alpha_speedtest.setdefault(image_key, {}).update(gen_eval["data"])
+                        elif gen_eval.get("image_type") == "video_test":
+                            alpha_video.setdefault(image_key, {}).update(gen_eval["data"])
+                    elif pref == "beta":
+                        if gen_eval.get("image_type") == "speed_test":
+                            beta_speedtest.setdefault(image_key, {}).update(gen_eval["data"])
+                        elif gen_eval.get("image_type") == "video_test":
+                            beta_video.setdefault(image_key, {}).update(gen_eval["data"])
+                    elif pref == "gamma":
+                        if gen_eval.get("image_type") == "speed_test":
+                            gamma_speedtest.setdefault(image_key, {}).update(gen_eval["data"])
+                        elif gen_eval.get("image_type") == "video_test":
+                            gamma_video.setdefault(image_key, {}).update(gen_eval["data"])
+
+                    # attempt to resolve now
+                    new_allowed = {
+                        "alpha_service": alpha_service, "beta_service": beta_service, "gamma_service": gamma_service,
+                        "alpha_speedtest": alpha_speedtest, "beta_speedtest": beta_speedtest, "gamma_speedtest": gamma_speedtest,
+                        "alpha_video": alpha_video, "beta_video": beta_video, "gamma_video": gamma_video,
+                        "voice_test": voice_test, "avearge": avearge,
+                    }
+                    resolved_after = resolve_expression_with_vars(expr, new_allowed)
+                    if resolved_after is not None:
+                        nested_keys = key_pattern.findall(rest)
+                        set_nested_value_case_insensitive(new_allowed[base_key], nested_keys, resolved_after)
+                        if isinstance(resolved_after, (int, float)):
+                            cell.value = resolved_after
+                        elif isinstance(resolved_after, str):
+                            cell.value = resolved_after
+                        else:
+                            try:
+                                cell.value = json.dumps(resolved_after)
+                            except Exception:
+                                cell.value = str(resolved_after)
+                        remapped += 1
+                        continue
+
+                log_append(text_area_placeholder, logs, f"[RULE3] Asking model for '{expr}' using '{base_key}'.")
+                value = ask_model_for_expression_value(token, base_key, allowed_vars[base_key], expr, model_generic, text_area_placeholder, logs)
+                if value is not None:
+                    nested_keys = key_pattern.findall(rest)
+                    set_nested_value_case_insensitive(allowed_vars[base_key], nested_keys, value)
+                    if isinstance(value, (int, float)):
+                        cell.value = value
+                    elif isinstance(value, str):
+                        cell.value = value
+                    else:
+                        try:
+                            cell.value = json.dumps(value)
+                        except Exception:
+                            cell.value = str(value)
+                    remapped += 1
+                else:
+                    log_append(text_area_placeholder, logs, f"[RULE3] Could not remap '{expr}'. Left as NULL.")
+
+        wb_r3.save(local_template)
+        log_append(text_area_placeholder, logs, f"[RULE3] Remapping complete. Cells remapped: {remapped}. Workbook saved.")
+    except Exception as e:
+        log_append(text_area_placeholder, logs, f"[ERROR] Rule 3 remapping failed: {e}")
+
+    # Final logs of variables
+    log_append(text_area_placeholder, logs, "=" * 60)
+    log_append(text_area_placeholder, logs, "FINAL STRUCTURED DATA (post-eval/rule2/rule3):")
+
+    def _pp(name, obj):
+        try:
+            s = json.dumps(obj, indent=2)
+        except Exception:
+            s = str(obj)
+        log_append(text_area_placeholder, logs, f"\n{name}:\n{s}")
+
+    _pp("alpha_service", alpha_service)
+    _pp("beta_service", beta_service)
+    _pp("gamma_service", gamma_service)
+    _pp("alpha_speedtest", alpha_speedtest)
+    _pp("beta_speedtest", beta_speedtest)
+    _pp("gamma_speedtest", gamma_speedtest)
+    _pp("alpha_video", alpha_video)
+    _pp("beta_video", beta_video)
+    _pp("gamma_video", gamma_video)
+    _pp("voice_test", voice_test)
+    _pp("avearge", avearge)
+    _pp("extract_text", extract_text)
+
+    # Return the updated workbook path
+    return local_template
 
 
 # ---------------- Streamlit UI ----------------
