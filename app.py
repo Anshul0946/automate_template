@@ -253,9 +253,9 @@ def analyze_generic_image(token: str, image_path: str, model_name: str, log_plac
         f"{json.dumps(GENERIC_SCHEMAS, indent=2)}\n\n"
 
         "SPECIAL RULES for voice_call images:\n"
-        "1) The 'time' field MUST come from the TOP-LEFT corner clock on the device screen. Always treat that as the time, even if it looks like '00:12'.\n"
+        "1) The 'time' field MUST come from the TOP-LEFT corner clock on the voice_call image. Always treat that as the time'.\n"
         "2) The 'call_duration_seconds' field MUST come from the central or prominent call duration text (usually in the middle). Convert it into total seconds as an integer.\n"
-        "3) If the same numeric string appears in both positions, resolve by POSITION: top-left -> time, central -> duration.\n"
+        "3) If the same numeric string appears in both positions, resolve by POSITION: top-left -> time, central -> duration , be really careful for time and duration finding in the voice_call image.\n"
         "4) Phone number: extract if visible, strip spaces/parentheses, preserve '+' if present.\n"
         "5) Call status: extract as shown (e.g., 'On call', 'Missed', 'Incoming').\n\n"
 
