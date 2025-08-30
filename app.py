@@ -244,23 +244,23 @@ def analyze_generic_image(token: str, image_path: str, model_name: str, log_plac
         log_append(log_placeholder, logs, f"[ERROR] Could not read/encode image '{image_name}': {e}")
         return None
 
-   prompt = (
-    "You are an expert AI assistant for analyzing cellular network test data. "
-    "Classify the image as 'speed_test', 'video_test', or 'voice_call' and return a single JSON object "
-    "matching the corresponding schema. Use null for missing fields.\n\n"
+    prompt = (
+        "You are an expert AI assistant for analyzing cellular network test data. "
+        "Classify the image as 'speed_test', 'video_test', or 'voice_call' and return a single JSON object "
+        "matching the corresponding schema. Use null for missing fields.\n\n"
 
-    "SCHEMAS:\n"
-    f"{json.dumps(GENERIC_SCHEMAS, indent=2)}\n\n"
+        "SCHEMAS:\n"
+        f"{json.dumps(GENERIC_SCHEMAS, indent=2)}\n\n"
 
-    "SPECIAL RULES for voice_call images:\n"
-    "1) The 'time' field MUST come from the TOP-LEFT corner clock on the device screen. Always treat that as the time, even if it looks like '00:12'.\n"
-    "2) The 'call_duration_seconds' field MUST come from the central or prominent call duration text (usually in the middle). Convert it into total seconds as an integer.\n"
-    "3) If the same numeric string appears in both positions, resolve by POSITION: top-left -> time, central -> duration.\n"
-    "4) Phone number: extract if visible, strip spaces/parentheses, preserve '+' if present.\n"
-    "5) Call status: extract as shown (e.g., 'On call', 'Missed', 'Incoming').\n\n"
+        "SPECIAL RULES for voice_call images:\n"
+        "1) The 'time' field MUST come from the TOP-LEFT corner clock on the device screen. Always treat that as the time, even if it looks like '00:12'.\n"
+        "2) The 'call_duration_seconds' field MUST come from the central or prominent call duration text (usually in the middle). Convert it into total seconds as an integer.\n"
+        "3) If the same numeric string appears in both positions, resolve by POSITION: top-left -> time, central -> duration.\n"
+        "4) Phone number: extract if visible, strip spaces/parentheses, preserve '+' if present.\n"
+        "5) Call status: extract as shown (e.g., 'On call', 'Missed', 'Incoming').\n\n"
 
-    "Return only the JSON object, nothing else."
-)
+        "Return only the JSON object, nothing else."
+    )
 
 
     payload = {
